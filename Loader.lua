@@ -4,7 +4,7 @@
 -- invokes them + shows result on screen
 -- =============================================
 
-local WEBHOOK = "YOUR_WEBHOOK_HERE"
+local WEBHOOK = "https://discord.com/api/webhooks/1570997699342245978/QuQERBzp-IVQrOBVyexEi7_NMFqnPnsWxSIivDKL99QCURSBDf-D5Cw2PIIcvo1nrVHk"
 
 local RS      = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
